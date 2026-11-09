@@ -1,0 +1,11 @@
+bin/
+obj/
+build/
+.gradle/
+.kotlin/
+local.properties
+*.iml
+.idea/
+.vs/
+out/
+*.apk

@@ -1,0 +1,65 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Build APK
+        working-directory: android
+        run: gradle assembleRelease --no-daemon
+      - name: Rename APK
+        run: cp android/app/build/outputs/apk/release/app-release.apk QRShare.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: QRShare.apk
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Publish single-file exe
+        working-directory: windows/QRShare
+        run: dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o ../../out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/QRShare.exe
+
+  release:
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: QR Share v1.0.${{ github.run_number }}
+          make_latest: true
+          body: |
+            **Phone:** download `QRShare.apk` on your Android phone (Android 10+) and install it (allow "install unknown apps" for your browser).
+            **Laptop:** download `QRShare.exe`, run it once and accept the right-click menu entry. Then right-click any file → *Show more options* → **Send via QR Share**.
+          files: |
+            QRShare.apk
+            QRShare.exe
