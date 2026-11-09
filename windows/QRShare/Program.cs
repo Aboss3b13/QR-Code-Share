@@ -11,6 +11,9 @@ static class Program
         // Headless helper used by the interop test: QRShare.exe --export-packets <file> <out> <count> <blockSize>
         if (args.Length == 5 && args[0] == "--export-packets")
             return ExportPackets(args[1], args[2], int.Parse(args[3]), int.Parse(args[4]));
+        // QRShare.exe --export-frames <file> <outDir> <frames> <presetIndex>  (renders 1920x1080 PNGs)
+        if (args.Length == 5 && args[0] == "--export-frames")
+            return ExportFrames(args[1], args[2], int.Parse(args[3]), MainForm.Presets[int.Parse(args[4])]);
 
         ApplicationConfiguration.Initialize();
 
@@ -68,15 +71,32 @@ static class Program
     {
         var payload = Protocol.BuildPayload(Path.GetFileName(file), File.ReadAllBytes(file));
         var enc = new FountainEncoder(payload, blockSize, (uint)Random.Shared.Next());
-        using var fs = File.Create(outPath);
-        using var w = new BinaryWriter(fs);
-        for (int i = 0; i < count; i++)
-        {
-            var p = enc.NextPacket();
-            w.Write(p.Length);
-            w.Write(p);
-        }
+        using var w = new StreamWriter(outPath);
+        for (int i = 0; i < count; i++) w.WriteLine(Protocol.Base45Encode(enc.NextPacket()));
         Console.WriteLine($"payload={payload.Length} blocks={enc.BlockCount}");
+        return 0;
+    }
+
+    static int ExportFrames(string file, string outDir, int frames, SpeedPreset p)
+    {
+        var payload = Protocol.BuildPayload(Path.GetFileName(file), File.ReadAllBytes(file));
+        var enc = new FountainEncoder(payload, p.BlockSize, (uint)Random.Shared.Next());
+        var writer = new ZXing.QrCode.QRCodeWriter();
+        var hints = new Dictionary<ZXing.EncodeHintType, object>
+        {
+            [ZXing.EncodeHintType.ERROR_CORRECTION] = ZXing.QrCode.Internal.ErrorCorrectionLevel.L,
+            [ZXing.EncodeHintType.MARGIN] = 4,
+        };
+        Directory.CreateDirectory(outDir);
+        for (int f = 0; f < frames; f++)
+        {
+            var ms = new ZXing.Common.BitMatrix[p.Cols * p.Rows];
+            for (int i = 0; i < ms.Length; i++)
+                ms[i] = writer.encode(Protocol.Base45Encode(enc.NextPacket()), ZXing.BarcodeFormat.QR_CODE, 0, 0, hints);
+            using var bmp = MainForm.Compose(ms, p.Cols, p.Rows, 1920, 1080);
+            bmp.Save(Path.Combine(outDir, $"frame{f:D4}.png"), System.Drawing.Imaging.ImageFormat.Png);
+            if (f == 0) Console.WriteLine($"blocks={enc.BlockCount} modules={ms[0].Width - 8}");
+        }
         return 0;
     }
 }

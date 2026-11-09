@@ -5,6 +5,7 @@ plugins {
     application
 }
 repositories { mavenCentral() }
+dependencies { implementation("com.google.zxing:javase:3.5.3") }
 kotlin { jvmToolchain(17) }
 sourceSets["main"].kotlin.srcDir("../../android/app/src/main/java/io/github/aboss3b13/qrshare/protocol")
 application { mainClass.set("InteropTestKt") }

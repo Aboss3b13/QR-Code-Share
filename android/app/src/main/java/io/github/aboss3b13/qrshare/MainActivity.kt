@@ -8,6 +8,8 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.MediaStore
+import android.hardware.camera2.CaptureRequest
+import android.util.Range
 import android.util.Size
 import android.view.HapticFeedbackConstants
 import android.view.View
@@ -15,6 +17,9 @@ import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.annotation.OptIn
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -32,6 +37,7 @@ import java.util.concurrent.Executors
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var cameraExecutor: ExecutorService
+    private lateinit var decodeExecutor: ExecutorService
     private val session = TransferSession()
     private lateinit var analyzer: QrAnalyzer
 
@@ -59,7 +65,8 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         cameraExecutor = Executors.newSingleThreadExecutor()
-        analyzer = QrAnalyzer(::onQrBytes)
+        decodeExecutor = Executors.newSingleThreadExecutor()
+        analyzer = QrAnalyzer(decodeExecutor, ::onQrTexts)
 
         binding.againButton.setOnClickListener { receiveAnother() }
         binding.openButton.setOnClickListener { openFile() }
@@ -69,20 +76,23 @@ class MainActivity : AppCompatActivity() {
         else requestPermission.launch(Manifest.permission.CAMERA)
     }
 
+    @OptIn(ExperimentalCamera2Interop::class)
     private fun startCamera() {
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
             val provider = providerFuture.get()
             val preview = Preview.Builder().build().also { it.setSurfaceProvider(binding.preview.surfaceProvider) }
-            val analysis = ImageAnalysis.Builder()
+            // Full HD analysis: the sender packs several dense codes into one screen.
+            val builder = ImageAnalysis.Builder()
                 .setResolutionSelector(
                     ResolutionSelector.Builder()
-                        .setResolutionStrategy(ResolutionStrategy(Size(1280, 960), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                        .setResolutionStrategy(ResolutionStrategy(Size(1920, 1080), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
                         .build()
                 )
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-                .also { it.setAnalyzer(cameraExecutor, analyzer) }
+            // Ask for a steady 30 fps so auto-exposure doesn't drop the frame rate indoors.
+            Camera2Interop.Extender(builder).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(30, 30))
+            val analysis = builder.build().also { it.setAnalyzer(cameraExecutor, analyzer) }
             try {
                 provider.unbindAll()
                 provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
@@ -92,28 +102,30 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** Called on the camera thread for every decoded QR code. */
-    private fun onQrBytes(bytes: ByteArray) {
-        if (paused) return
-        when (val ev = session.onQrBytes(bytes)) {
-            is TransferSession.Event.Progress -> {
-                val now = SystemClock.elapsedRealtime()
-                if (transferStart == 0L) transferStart = now
-                qrCount++
-                if (now - lastUiUpdate < 100 && ev.known < ev.total) return
-                lastUiUpdate = now
-                runOnUiThread { showProgress(ev, now) }
+    /** Called on the decode thread with all QR codes found in one camera frame. */
+    private fun onQrTexts(texts: List<String>) {
+        for (text in texts) {
+            if (paused) return
+            when (val ev = session.onQrText(text)) {
+                is TransferSession.Event.Progress -> {
+                    val now = SystemClock.elapsedRealtime()
+                    if (transferStart == 0L) transferStart = now
+                    qrCount++
+                    if (now - lastUiUpdate < 100) continue
+                    lastUiUpdate = now
+                    runOnUiThread { showProgress(ev, now) }
+                }
+                is TransferSession.Event.Completed -> {
+                    paused = true
+                    val file = ev.file
+                    runOnUiThread { onFileReceived(file) }
+                }
+                is TransferSession.Event.Failed -> runOnUiThread {
+                    Toast.makeText(this, "Transfer failed: ${ev.message}. Keep scanning to retry.", Toast.LENGTH_LONG).show()
+                    resetStats()
+                }
+                TransferSession.Event.Ignored -> {}
             }
-            is TransferSession.Event.Completed -> {
-                paused = true
-                val file = ev.file
-                runOnUiThread { onFileReceived(file) }
-            }
-            is TransferSession.Event.Failed -> runOnUiThread {
-                Toast.makeText(this, "Transfer failed: ${ev.message}. Keep scanning to retry.", Toast.LENGTH_LONG).show()
-                resetStats()
-            }
-            TransferSession.Event.Ignored -> {}
         }
     }
 
@@ -128,15 +140,20 @@ class MainActivity : AppCompatActivity() {
             lastRateQr = qrCount
             lastRateFrames = analyzer.framesAnalyzed
         }
-        val fraction = ev.known.toDouble() / ev.total
+        // Repair packets only pay off at the very end (Gaussian elimination), so estimate
+        // progress from unique packets received: the file needs about 5% more than its block count.
+        val fraction = maxOf(ev.known.toDouble() / ev.total, minOf(ev.packets / (ev.total * 1.05), 0.99))
         binding.progress.setProgressCompat((fraction * 1000).toInt(), true)
         binding.status.text = String.format(Locale.US, "Receiving… %.0f%%", fraction * 100)
-        val elapsed = (now - transferStart) / 1000.0
+        val elapsed = maxOf((now - transferStart) / 1000.0, 0.001)
+        val blockSize = ev.payloadLength.toDouble() / ev.total
+        val rate = ev.packets * blockSize / elapsed
+        val remaining = maxOf(0.0, ev.total * 1.05 - ev.packets) * blockSize / maxOf(rate, 1.0)
         binding.detail.text = String.format(
             Locale.US,
-            "%s of %s  ·  blocks %d/%d\n%d QR read  ·  %.1f QR/s  ·  camera %.0f fps  ·  %.0fs",
-            formatSize(ev.known.toLong() * ev.payloadLength / ev.total), formatSize(ev.payloadLength.toLong()),
-            ev.known, ev.total, ev.packets, qrPerSec, framesPerSec, elapsed,
+            "%s/s  ·  %s total  ·  ~%.0fs left\n%d codes read  ·  %.0f codes/s  ·  camera %.0f fps",
+            formatSize(rate.toLong()), formatSize(ev.payloadLength.toLong()), remaining,
+            ev.packets, qrPerSec, framesPerSec,
         )
     }
 
@@ -156,7 +173,6 @@ class MainActivity : AppCompatActivity() {
         binding.openButton.isEnabled = savedUri != null
         binding.shareButton.isEnabled = savedUri != null
         binding.progressPanel.visibility = View.GONE
-        binding.guide.visibility = View.GONE
         binding.donePanel.visibility = View.VISIBLE
     }
 
@@ -201,7 +217,6 @@ class MainActivity : AppCompatActivity() {
         resetStats()
         binding.donePanel.visibility = View.GONE
         binding.progressPanel.visibility = View.VISIBLE
-        binding.guide.visibility = View.VISIBLE
         binding.progress.setProgressCompat(0, false)
         binding.status.text = "Waiting for QR code…"
         binding.detail.text = " "
@@ -221,5 +236,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
+        decodeExecutor.shutdown()
+        analyzer.close()
     }
 }

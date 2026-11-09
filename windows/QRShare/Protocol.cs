@@ -5,11 +5,11 @@ using System.Text;
 
 namespace QRShare;
 
-/// <summary>QR Share Transfer Protocol v1 — see PROTOCOL.md.</summary>
+/// <summary>QR Share Transfer Protocol v2 — see PROTOCOL.md.</summary>
 public static class Protocol
 {
     public const int HeaderSize = 18;
-    public const byte Version = 1;
+    public const byte Version = 2;
     static readonly int[] Degrees = { 1, 2, 3, 4, 8, 16, 32, 64 };
     static readonly int[] Cumulative = { 10, 110, 210, 310, 500, 750, 900, 1000 };
 
@@ -52,6 +52,28 @@ public static class Protocol
             return x;
         }
         public uint NextMod(uint n) => Next() % n;
+    }
+
+    const string Base45Chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
+
+    /// <summary>RFC 9285 Base45. The output only uses the QR alphanumeric charset, so the
+    /// QR code is encoded in alphanumeric mode (5.5 bits/char, ~97% as dense as byte mode)
+    /// and every scanner returns it unchanged as plain text.</summary>
+    public static string Base45Encode(ReadOnlySpan<byte> b)
+    {
+        var sb = new StringBuilder(b.Length / 2 * 3 + 2);
+        int i = 0;
+        for (; i + 1 < b.Length; i += 2)
+        {
+            int x = b[i] * 256 + b[i + 1];
+            sb.Append(Base45Chars[x % 45]).Append(Base45Chars[x / 45 % 45]).Append(Base45Chars[x / 2025]);
+        }
+        if (i < b.Length)
+        {
+            int x = b[i];
+            sb.Append(Base45Chars[x % 45]).Append(Base45Chars[x / 45]);
+        }
+        return sb.ToString();
     }
 
     /// <summary>Builds the payload: header + (optionally zlib-compressed) file body.</summary>

@@ -1,4 +1,4 @@
-# QR Share Transfer Protocol (QSTP) v1
+# QR Share Transfer Protocol (QSTP) v2
 
 A one-way, offline file-transfer protocol: the sender shows an endless animation
 of QR codes, the receiver films it. No network, no back channel. Frames may be
@@ -28,12 +28,21 @@ The payload (length `L`) is cut into `K = ceil(L / B)` blocks of `B` bytes
 
 ## 3. Packets (one packet = one QR code)
 
-Each QR code holds one binary packet, encoded in QR *byte mode*:
+Each QR code holds one binary packet, written as **Base45** text (RFC 9285).
+Base45 only uses the 45 characters of the QR *alphanumeric* mode, which stores
+5.5 bits per character, so a packet takes ~97% of the space it would in byte
+mode, and every scanner (ZXing, ML Kit, phone camera apps) returns it as plain
+text without charset problems.
+
+The sender may show several QR codes per screen frame (e.g. a 3×2 grid); each
+code is an independent packet.
+
+Packet layout before Base45:
 
 | Offset | Size | Field                                   |
 | ------ | ---- | --------------------------------------- |
 | 0      | 2    | magic `0x51 0x53` ("QS")                |
-| 2      | 1    | version = `1`                           |
+| 2      | 1    | version = `2`                           |
 | 3      | 1    | flags (reserved, `0`)                   |
 | 4      | 4    | transfer id (random per transfer)       |
 | 8      | 4    | payload length `L`                      |

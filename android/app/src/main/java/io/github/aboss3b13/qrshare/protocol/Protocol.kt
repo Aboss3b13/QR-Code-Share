@@ -5,10 +5,10 @@ import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.util.zip.Inflater
 
-/** QR Share Transfer Protocol v1 — see PROTOCOL.md. Pure Kotlin, no Android dependencies. */
+/** QR Share Transfer Protocol v2 — see PROTOCOL.md. Pure Kotlin, no Android dependencies. */
 object Protocol {
     const val HEADER_SIZE = 18
-    const val VERSION: Byte = 1
+    const val VERSION: Byte = 2
     private val DEGREES = intArrayOf(1, 2, 3, 4, 8, 16, 32, 64)
     private val CUMULATIVE = intArrayOf(10, 110, 210, 310, 500, 750, 900, 1000)
 
@@ -53,7 +53,10 @@ class Packet(
     val data: ByteArray,
 ) {
     companion object {
-        /** Returns null if the bytes are not a valid QS v1 packet. */
+        /** Parses the Base45 text content of a QR code. Returns null if it is not a QS v2 packet. */
+        fun parseText(text: String): Packet? = Base45.decode(text)?.let { parse(it) }
+
+        /** Returns null if the bytes are not a valid QS v2 packet. */
         fun parse(bytes: ByteArray): Packet? {
             if (bytes.size < Protocol.HEADER_SIZE) return null
             if (bytes[0] != 0x51.toByte() || bytes[1] != 0x53.toByte()) return null
@@ -70,25 +73,63 @@ class Packet(
     }
 }
 
+/** RFC 9285 Base45: maps onto the QR alphanumeric charset (~97% as dense as byte mode). */
+object Base45 {
+    private const val CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+    private val VALUES = IntArray(128) { -1 }.also { t -> CHARSET.forEachIndexed { i, c -> t[c.code] = i } }
+
+    fun decode(s: String): ByteArray? {
+        val n = s.length
+        if (n % 3 == 1) return null
+        val out = ByteArray(n / 3 * 2 + if (n % 3 == 2) 1 else 0)
+        var o = 0
+        var i = 0
+        while (i < n) {
+            val c = v(s[i]); val d = v(s[i + 1])
+            if (c < 0 || d < 0) return null
+            if (i + 2 < n) {
+                val e = v(s[i + 2])
+                if (e < 0) return null
+                val x = c + d * 45 + e * 2025
+                if (x > 0xFFFF) return null
+                out[o++] = (x shr 8).toByte(); out[o++] = x.toByte()
+                i += 3
+            } else {
+                val x = c + d * 45
+                if (x > 0xFF) return null
+                out[o++] = x.toByte()
+                i += 2
+            }
+        }
+        return out
+    }
+
+    private fun v(ch: Char): Int = if (ch.code < 128) VALUES[ch.code] else -1
+}
+
 class ReceivedFile(val name: String, val data: ByteArray)
 
 class TransferException(message: String) : Exception(message)
 
-/** Peeling fountain decoder for one transfer. */
+/**
+ * Fountain decoder for one transfer: peeling plus Gaussian elimination over GF(2).
+ * Block data is held as LongArrays so XORs run 8 bytes at a time.
+ */
 class FountainDecoder(val transferId: Int, val payloadLength: Int, val blockSize: Int) {
     companion object {
-        const val MAX_GAUSS_UNKNOWNS = 1500
+        const val MAX_GAUSS_UNKNOWNS = 4000
     }
 
     val blockCount = Protocol.blockCount(payloadLength, blockSize)
-    private val known = arrayOfNulls<ByteArray>(blockCount)
+    private val longs = (blockSize + 7) / 8
+    private val known = arrayOfNulls<LongArray>(blockCount)
     var knownCount = 0
         private set
     var packetsReceived = 0
         private set
     private val seenSeeds = HashSet<Int>()
 
-    private class Equation(val unknown: MutableSet<Int>, val data: ByteArray)
+    private class Equation(val unknown: MutableSet<Int>, val data: LongArray)
     private val waiting = HashMap<Int, MutableList<Equation>>()
     private val pending = LinkedHashSet<Equation>()
     private var nextSolveAt = 0
@@ -101,7 +142,7 @@ class FountainDecoder(val transferId: Int, val payloadLength: Int, val blockSize
         if (!seenSeeds.add(packet.seed)) return false
         packetsReceived++
         if (isComplete) return true
-        val data = packet.data.copyOf()
+        val data = toLongs(packet.data)
         val unknown = HashSet<Int>()
         for (i in Protocol.indicesForSeed(packet.seed, blockCount)) {
             val k = known[i]
@@ -120,8 +161,21 @@ class FountainDecoder(val transferId: Int, val payloadLength: Int, val blockSize
         return true
     }
 
-    private fun resolve(first: Int, firstData: ByteArray) {
-        val queue = ArrayDeque<Pair<Int, ByteArray>>()
+    private fun toLongs(b: ByteArray): LongArray {
+        val out = LongArray(longs)
+        val bb = ByteBuffer.wrap(b)
+        val full = b.size / 8
+        for (i in 0 until full) out[i] = bb.getLong(i * 8)
+        if (full < longs) {
+            var v = 0L
+            for (j in 0 until 8) v = (v shl 8) or (if (full * 8 + j < b.size) (b[full * 8 + j].toLong() and 0xFF) else 0L)
+            out[full] = v
+        }
+        return out
+    }
+
+    private fun resolve(first: Int, firstData: LongArray) {
+        val queue = ArrayDeque<Pair<Int, LongArray>>()
         queue.add(first to firstData)
         while (queue.isNotEmpty()) {
             val (idx, data) = queue.removeFirst()
@@ -145,8 +199,9 @@ class FountainDecoder(val transferId: Int, val payloadLength: Int, val blockSize
 
     /**
      * When peeling stalls but there are at least as many stored equations as unknown
-     * blocks, solve the remaining system with Gaussian elimination over GF(2).
-     * This brings the overhead close to the theoretical minimum.
+     * blocks, solve the rest with Gaussian elimination over GF(2). A bits-only pass
+     * first checks the rank and picks u independent rows; only then are the block
+     * data XORs done, on that u x u system.
      */
     private fun maybeSolve() {
         val u = blockCount - knownCount
@@ -158,28 +213,47 @@ class FountainDecoder(val transferId: Int, val payloadLength: Int, val blockSize
         var c = 0
         for (i in 0 until blockCount) if (known[i] == null) { colOf[i] = c; cols[c++] = i }
         val words = (u + 63) / 64
-        val rows = pending.toMutableList()
-        val bits = Array(rows.size) { r ->
-            LongArray(words).also { w -> for (i in rows[r].unknown) { val col = colOf[i]; w[col shr 6] = w[col shr 6] or (1L shl (col and 63)) } }
+        val rows = pending.toList()
+        fun bitsOf(eq: Equation) = LongArray(words).also { w ->
+            for (i in eq.unknown) { val col = colOf[i]; w[col shr 6] = w[col shr 6] or (1L shl (col and 63)) }
         }
-        // Rank check on a copy first, so the expensive data XORs only run when we will succeed.
-        if (rank(Array(bits.size) { bits[it].copyOf() }, u) < u) return
 
-        val data = Array(rows.size) { rows[it].data }
+        // Pass 1: bits only, remember which original rows became pivots.
+        val m = Array(rows.size) { bitsOf(rows[it]) }
+        val origin = IntArray(rows.size) { it }
         for (col in 0 until u) {
-            val w = col shr 6
-            val m = 1L shl (col and 63)
+            val w = col shr 6; val bit = 1L shl (col and 63)
             var p = col
-            while (bits[p][w] and m == 0L) p++
+            while (p < m.size && m[p][w] and bit == 0L) p++
+            if (p == m.size) return // not solvable yet
+            if (p != col) {
+                val t = m[p]; m[p] = m[col]; m[col] = t
+                val o = origin[p]; origin[p] = origin[col]; origin[col] = o
+            }
+            val pr = m[col]
+            for (r in col + 1 until m.size) if (m[r][w] and bit != 0L) {
+                val rr = m[r]
+                for (k in w until words) rr[k] = rr[k] xor pr[k]
+            }
+        }
+
+        // Pass 2: Gauss-Jordan with data on the u selected rows.
+        val bits = Array(u) { bitsOf(rows[origin[it]]) }
+        val data = Array(u) { rows[origin[it]].data }
+        for (col in 0 until u) {
+            val w = col shr 6; val bit = 1L shl (col and 63)
+            var p = col
+            while (bits[p][w] and bit == 0L) p++
             if (p != col) {
                 val tb = bits[p]; bits[p] = bits[col]; bits[col] = tb
                 val td = data[p]; data[p] = data[col]; data[col] = td
             }
-            for (r in bits.indices) {
-                if (r != col && bits[r][w] and m != 0L) {
-                    val rb = bits[r]; val pb = bits[col]
+            val pb = bits[col]; val pd = data[col]
+            for (r in 0 until u) {
+                if (r != col && bits[r][w] and bit != 0L) {
+                    val rb = bits[r]
                     for (k in 0 until words) rb[k] = rb[k] xor pb[k]
-                    xorInto(data[r], data[col])
+                    xorInto(data[r], pd)
                 }
             }
         }
@@ -189,34 +263,23 @@ class FountainDecoder(val transferId: Int, val payloadLength: Int, val blockSize
         waiting.clear()
     }
 
-    private fun rank(m: Array<LongArray>, cols: Int): Int {
-        var rank = 0
-        for (col in 0 until cols) {
-            val w = col shr 6
-            val bit = 1L shl (col and 63)
-            var p = rank
-            while (p < m.size && m[p][w] and bit == 0L) p++
-            if (p == m.size) return rank
-            val t = m[p]; m[p] = m[rank]; m[rank] = t
-            for (r in rank + 1 until m.size) if (m[r][w] and bit != 0L) {
-                val rr = m[r]; val pr = m[rank]
-                for (k in w until rr.size) rr[k] = rr[k] xor pr[k]
-            }
-            rank++
-        }
-        return rank
-    }
-
-    private fun xorInto(target: ByteArray, src: ByteArray) {
-        for (i in target.indices) target[i] = (target[i].toInt() xor src[i].toInt()).toByte()
+    private fun xorInto(target: LongArray, src: LongArray) {
+        for (i in target.indices) target[i] = target[i] xor src[i]
     }
 
     fun payload(): ByteArray {
         check(isComplete)
+        val stride = longs * 8
+        val bb = ByteBuffer.allocate(blockCount * stride)
+        for (i in 0 until blockCount) {
+            bb.position(i * stride)
+            for (v in known[i]!!) bb.putLong(v)
+        }
+        val all = bb.array()
         val out = ByteArray(payloadLength)
         for (i in 0 until blockCount) {
             val start = i * blockSize
-            System.arraycopy(known[i]!!, 0, out, start, minOf(blockSize, payloadLength - start))
+            System.arraycopy(all, i * stride, out, start, minOf(blockSize, payloadLength - start))
         }
         return out
     }

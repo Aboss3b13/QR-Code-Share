@@ -25,10 +25,27 @@ ask you to allow installing apps from your browser once.
    Missed frames don't matter — just hold steady until it's 100 %.
 4. The file lands in `Download/QR Share` on the phone, with its SHA-256 verified.
 
-Tips: press **F11** for fullscreen on the laptop, turn screen brightness up, and
-raise *Frames/s* or *Bytes/QR* in the toolbar if your phone keeps up (watch the
-"QR/s" counter on the phone). Expect roughly 5–15 KB/s, so this is meant for
-documents, images and small files rather than videos.
+### Speed
+
+The sender shows a **grid of QR codes** that changes many times per second; the
+phone reads all codes in each camera frame with Google ML Kit (on-device,
+offline). Pick a preset in the *Speed* box:
+
+| Preset | Codes per frame | Bytes per code | Frames/s | Max. throughput |
+| ------ | --------------- | -------------- | -------- | --------------- |
+| Reliable | 1 | 600 | 10 | 6 KB/s |
+| Fast (default) | 4 (2×2) | 900 | 15 | 54 KB/s |
+| Maximum | 6 (3×2) | 1100 | 20 | 132 KB/s |
+| Extreme | 9 (3×3) | 1000 | 20 | 180 KB/s (experimental) |
+
+Real speed is lower: it depends on how many codes per second the phone actually
+reads (shown live on the phone). For the best results press **F11** for
+fullscreen, set the laptop brightness to maximum, and hold the phone so the
+screen fills the camera view. If progress stalls, step down one preset.
+
+Physical limit: a phone camera records ~30 frames/s, and screen-to-camera links
+top out around 100–200 KB/s even in research systems, so 1 MB/s is not
+reachable with a camera alone.
 
 ## How it works
 

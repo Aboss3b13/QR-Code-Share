@@ -1,5 +1,6 @@
+using System.Diagnostics;
 using System.Drawing.Imaging;
-using System.Text;
+using System.Runtime.InteropServices;
 using ZXing;
 using ZXing.Common;
 using ZXing.QrCode;
@@ -7,48 +8,67 @@ using ZXing.QrCode.Internal;
 
 namespace QRShare;
 
+public sealed record SpeedPreset(string Name, int Cols, int Rows, int BlockSize, int Fps)
+{
+    public override string ToString() => Name;
+}
+
 public sealed class MainForm : Form
 {
-    readonly string _fileName;
+    internal static readonly SpeedPreset[] Presets =
+    {
+        new("Reliable — 1 code", 1, 1, 600, 10),
+        new("Fast — 4 codes", 2, 2, 900, 15),
+        new("Maximum — 6 codes", 3, 2, 1100, 20),
+        new("Extreme — 9 codes", 3, 3, 1000, 20),
+    };
+
     readonly byte[] _payload;
     readonly long _originalSize;
-    FountainEncoder _encoder;
+    volatile FountainEncoder _encoder;
 
     readonly QrView _view = new() { Dock = DockStyle.Fill };
-    readonly System.Windows.Forms.Timer _timer = new();
-    readonly NumericUpDown _fps = new() { Minimum = 1, Maximum = 30, Value = 12, Width = 55 };
-    readonly NumericUpDown _block = new() { Minimum = 100, Maximum = 2000, Increment = 100, Value = 800, Width = 70 };
+    readonly ComboBox _preset = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 170 };
+    readonly NumericUpDown _cols = new() { Minimum = 1, Maximum = 6, Value = 2, Width = 40 };
+    readonly NumericUpDown _rows = new() { Minimum = 1, Maximum = 4, Value = 2, Width = 40 };
+    readonly NumericUpDown _fps = new() { Minimum = 1, Maximum = 30, Value = 15, Width = 50 };
+    readonly NumericUpDown _block = new() { Minimum = 100, Maximum = 2800, Increment = 100, Value = 900, Width = 65 };
     readonly Button _pause = new() { Text = "Pause", AutoSize = true };
     readonly Button _full = new() { Text = "Fullscreen (F11)", AutoSize = true };
     readonly Label _status = new() { Dock = DockStyle.Bottom, Height = 28, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(8, 0, 0, 0) };
     readonly FlowLayoutPanel _toolbar = new() { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(6), WrapContents = true };
-    readonly QRCodeWriter _writer = new();
-    readonly Dictionary<EncodeHintType, object> _hints = new()
-    {
-        [EncodeHintType.ERROR_CORRECTION] = ErrorCorrectionLevel.L,
-        [EncodeHintType.MARGIN] = 4,
-    };
-    readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
+
+    // Snapshot of the settings, read by the render thread.
+    volatile int _cfgCols = 2, _cfgRows = 2, _cfgFps = 15;
+    volatile bool _paused, _running = true;
+    volatile int _viewW, _viewH;
+    long _framesShown;
+    int _qrModules;
+    readonly Stopwatch _clock = Stopwatch.StartNew();
+    readonly Thread _renderThread;
+
+    [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint ms);
+    [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint ms);
 
     public MainForm(string fileName, byte[] data)
     {
-        _fileName = fileName;
         _originalSize = data.LongLength;
         _payload = Protocol.BuildPayload(fileName, data);
         _encoder = NewEncoder();
 
         Text = $"QR Share — {fileName}";
-        Width = 900; Height = 900;
+        Width = 1280; Height = 800;
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Color.White;
         KeyPreview = true;
         try { Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath!); } catch { }
 
-        _toolbar.Controls.Add(new Label { Text = fileName, AutoSize = true, Font = new Font(Font, FontStyle.Bold), Margin = new Padding(3, 8, 12, 3) });
-        _toolbar.Controls.Add(new Label { Text = "Frames/s", AutoSize = true, Margin = new Padding(3, 8, 3, 3) });
-        _toolbar.Controls.Add(_fps);
-        _toolbar.Controls.Add(new Label { Text = "Bytes/QR", AutoSize = true, Margin = new Padding(12, 8, 3, 3) });
-        _toolbar.Controls.Add(_block);
+        _preset.Items.AddRange(Presets);
+        AddLabel(fileName, bold: true);
+        AddLabel("Speed"); _toolbar.Controls.Add(_preset);
+        AddLabel("Grid"); _toolbar.Controls.Add(_cols); AddLabel("×", 0); _toolbar.Controls.Add(_rows);
+        AddLabel("Frames/s"); _toolbar.Controls.Add(_fps);
+        AddLabel("Bytes/code"); _toolbar.Controls.Add(_block);
         _toolbar.Controls.Add(_pause);
         _toolbar.Controls.Add(_full);
 
@@ -56,16 +76,46 @@ public sealed class MainForm : Form
         Controls.Add(_toolbar);
         Controls.Add(_status);
 
-        _fps.ValueChanged += (_, _) => _timer.Interval = 1000 / (int)_fps.Value;
-        _block.ValueChanged += (_, _) => { _encoder = NewEncoder(); _clock.Restart(); };
+        _preset.SelectedIndexChanged += (_, _) => ApplyPreset((SpeedPreset)_preset.SelectedItem!);
+        _cols.ValueChanged += (_, _) => SettingsChanged(false);
+        _rows.ValueChanged += (_, _) => SettingsChanged(false);
+        _fps.ValueChanged += (_, _) => SettingsChanged(false);
+        _block.ValueChanged += (_, _) => SettingsChanged(true);
         _pause.Click += (_, _) => TogglePause();
         _full.Click += (_, _) => ToggleFullscreen();
+        _view.Resize += (_, _) => { _viewW = _view.ClientSize.Width; _viewH = _view.ClientSize.Height; };
         KeyDown += OnKey;
 
-        _timer.Interval = 1000 / (int)_fps.Value;
-        _timer.Tick += (_, _) => ShowNextFrame();
-        _timer.Start();
-        ShowNextFrame();
+        _preset.SelectedIndex = 1;
+        _viewW = _view.ClientSize.Width; _viewH = _view.ClientSize.Height;
+
+        var ui = new System.Windows.Forms.Timer { Interval = 250 };
+        ui.Tick += (_, _) => UpdateStatus();
+        ui.Start();
+
+        timeBeginPeriod(1);
+        _renderThread = new Thread(RenderLoop) { IsBackground = true, Name = "QR render", Priority = ThreadPriority.AboveNormal };
+        _renderThread.Start();
+    }
+
+    void AddLabel(string text, int leftMargin = 10, bool bold = false) =>
+        _toolbar.Controls.Add(new Label
+        {
+            Text = text, AutoSize = true, Margin = new Padding(leftMargin, 8, 3, 3),
+            Font = bold ? new Font(Font, FontStyle.Bold) : Font,
+        });
+
+    void ApplyPreset(SpeedPreset p)
+    {
+        _cols.Value = p.Cols; _rows.Value = p.Rows; _fps.Value = p.Fps;
+        _block.Value = p.BlockSize; // fires SettingsChanged(true) if it differs
+        SettingsChanged(false);
+    }
+
+    void SettingsChanged(bool newEncoder)
+    {
+        _cfgCols = (int)_cols.Value; _cfgRows = (int)_rows.Value; _cfgFps = (int)_fps.Value;
+        if (newEncoder) { _encoder = NewEncoder(); _clock.Restart(); }
     }
 
     FountainEncoder NewEncoder() => new(_payload, (int)_block.Value, (uint)Random.Shared.NextInt64(1, uint.MaxValue));
@@ -77,12 +127,13 @@ public sealed class MainForm : Form
         else if (e.KeyCode == Keys.Space) TogglePause();
         else return;
         e.Handled = true;
+        e.SuppressKeyPress = true;
     }
 
     void TogglePause()
     {
-        _timer.Enabled = !_timer.Enabled;
-        _pause.Text = _timer.Enabled ? "Pause" : "Resume";
+        _paused = !_paused;
+        _pause.Text = _paused ? "Resume" : "Pause";
     }
 
     FormWindowState _prevState;
@@ -95,28 +146,103 @@ public sealed class MainForm : Form
             WindowState = FormWindowState.Normal;
             WindowState = FormWindowState.Maximized;
             _toolbar.Visible = false;
+            _status.Visible = false;
         }
         else
         {
             FormBorderStyle = FormBorderStyle.Sizable;
             WindowState = _prevState;
             _toolbar.Visible = true;
+            _status.Visible = true;
         }
     }
 
-    void ShowNextFrame()
+    /// <summary>Renders frames ahead of time on a background thread and presents them on a steady clock.</summary>
+    void RenderLoop()
     {
-        byte[] packet = _encoder.NextPacket();
-        // Latin-1 maps every byte 1:1 to a char, so ZXing emits a pure QR byte-mode segment.
-        string contents = Encoding.Latin1.GetString(packet);
-        BitMatrix m = _writer.encode(contents, BarcodeFormat.QR_CODE, 0, 0, _hints);
-        _view.SetMatrix(m);
+        var writer = new QRCodeWriter();
+        var hints = new Dictionary<EncodeHintType, object>
+        {
+            [EncodeHintType.ERROR_CORRECTION] = ErrorCorrectionLevel.L,
+            [EncodeHintType.MARGIN] = 4,
+        };
+        var timer = Stopwatch.StartNew();
+        double next = 0;
+        while (_running)
+        {
+            if (_paused || _viewW < 50 || _viewH < 50) { Thread.Sleep(30); next = timer.Elapsed.TotalMilliseconds; continue; }
 
-        int k = _encoder.BlockCount;
-        double secs = Math.Max(_clock.Elapsed.TotalSeconds, 0.001);
-        double minSeconds = k / (double)_fps.Value;
-        _status.Text = $"{FormatSize(_originalSize)} → {k} blocks of {_encoder.BlockSize} B  ·  frame {_encoder.FramesSent}  ·  " +
-                       $"QR {m.Width - 8}×{m.Width - 8} modules  ·  first full pass ≈ {minSeconds:0}s  ·  running {secs:0}s  ·  Space = pause, F11 = fullscreen";
+            int cols = _cfgCols, rows = _cfgRows, w = _viewW, h = _viewH;
+            var enc = _encoder;
+            var matrices = new BitMatrix[cols * rows];
+            for (int i = 0; i < matrices.Length; i++)
+                matrices[i] = writer.encode(Protocol.Base45Encode(enc.NextPacket()), BarcodeFormat.QR_CODE, 0, 0, hints);
+            var bmp = Compose(matrices, cols, rows, w, h);
+            _qrModules = matrices[0].Width - 8;
+
+            double interval = 1000.0 / Math.Max(1, _cfgFps);
+            double now = timer.Elapsed.TotalMilliseconds;
+            if (next < now - interval) next = now; // fell behind: resync instead of bursting
+            double wait = next - now;
+            if (wait > 2) Thread.Sleep((int)(wait - 1.5));
+            while (timer.Elapsed.TotalMilliseconds < next) Thread.SpinWait(50);
+            next += interval;
+
+            try { _view.Invoke(() => { _view.Present(bmp); _framesShown++; }); }
+            catch (ObjectDisposedException) { return; }
+            catch (InvalidOperationException) { return; }
+        }
+    }
+
+    /// <summary>Lays the QR codes out in a grid, each drawn with whole-pixel modules.</summary>
+    internal static unsafe Bitmap Compose(BitMatrix[] matrices, int cols, int rows, int w, int h)
+    {
+        var bmp = new Bitmap(w, h, PixelFormat.Format32bppRgb);
+        var data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
+        try
+        {
+            byte* basePtr = (byte*)data.Scan0;
+            for (int y = 0; y < h; y++) new Span<uint>(basePtr + y * data.Stride, w).Fill(0xFFFFFFFFu);
+
+            int n = matrices[0].Width;
+            int cellW = w / cols, cellH = h / rows;
+            int scale = Math.Max(1, Math.Min(cellW, cellH) / n);
+            int size = n * scale;
+            for (int c = 0; c < matrices.Length; c++)
+            {
+                var m = matrices[c];
+                int ox = (c % cols) * cellW + (cellW - size) / 2;
+                int oy = (c / cols) * cellH + (cellH - size) / 2;
+                for (int my = 0; my < n; my++)
+                {
+                    for (int mx = 0; mx < n; mx++)
+                    {
+                        if (!m[mx, my]) continue;
+                        for (int dy = 0; dy < scale; dy++)
+                        {
+                            int py = oy + my * scale + dy;
+                            if ((uint)py >= (uint)h) continue;
+                            uint* row = (uint*)(basePtr + py * data.Stride);
+                            int px = ox + mx * scale;
+                            int len = Math.Min(scale, w - px);
+                            if (px >= 0 && len > 0) new Span<uint>(row + px, len).Fill(0xFF000000u);
+                        }
+                    }
+                }
+            }
+        }
+        finally { bmp.UnlockBits(data); }
+        return bmp;
+    }
+
+    void UpdateStatus()
+    {
+        var enc = _encoder;
+        int perFrame = _cfgCols * _cfgRows;
+        double nominal = perFrame * enc.BlockSize * (double)_cfgFps;
+        double firstPass = enc.BlockCount / (double)(perFrame * _cfgFps);
+        _status.Text = $"{FormatSize(_originalSize)} → {enc.BlockCount} blocks  ·  {perFrame} codes × {enc.BlockSize} B × {_cfgFps} fps = {FormatSize((long)nominal)}/s max  ·  " +
+                       $"QR {_qrModules}×{_qrModules}  ·  best case ≈ {firstPass:0}s  ·  frame {_framesShown}  ·  Space = pause, F11 = fullscreen";
     }
 
     static string FormatSize(long b) => b switch
@@ -126,53 +252,37 @@ public sealed class MainForm : Form
         _ => $"{b / 1024.0 / 1024.0:0.00} MB",
     };
 
-    protected override void OnFormClosed(FormClosedEventArgs e)
+    protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        _timer.Stop();
-        base.OnFormClosed(e);
+        _running = false;
+        timeEndPeriod(1);
+        base.OnFormClosing(e);
     }
 }
 
-/// <summary>Draws a QR BitMatrix as crisp, integer-scaled square pixels.</summary>
+/// <summary>Shows pre-rendered frames 1:1, no scaling.</summary>
 sealed class QrView : Control
 {
     Bitmap? _bmp;
 
     public QrView()
     {
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.Opaque, true);
         BackColor = Color.White;
     }
 
-    public unsafe void SetMatrix(BitMatrix m)
+    public void Present(Bitmap bmp)
     {
-        if (_bmp == null || _bmp.Width != m.Width || _bmp.Height != m.Height)
-        {
-            _bmp?.Dispose();
-            _bmp = new Bitmap(m.Width, m.Height, PixelFormat.Format32bppRgb);
-        }
-        var data = _bmp.LockBits(new Rectangle(0, 0, m.Width, m.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
-        try
-        {
-            for (int y = 0; y < m.Height; y++)
-            {
-                uint* row = (uint*)((byte*)data.Scan0 + y * data.Stride);
-                for (int x = 0; x < m.Width; x++) row[x] = m[x, y] ? 0xFF000000u : 0xFFFFFFFFu;
-            }
-        }
-        finally { _bmp.UnlockBits(data); }
+        var old = _bmp;
+        _bmp = bmp;
         Invalidate();
+        Update();
+        old?.Dispose();
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
-        e.Graphics.Clear(Color.White);
-        if (_bmp == null) return;
-        int scale = Math.Max(1, Math.Min(ClientSize.Width, ClientSize.Height) / _bmp.Width);
-        int size = _bmp.Width * scale;
-        int x = (ClientSize.Width - size) / 2, y = (ClientSize.Height - size) / 2;
-        e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.NearestNeighbor;
-        e.Graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
-        e.Graphics.DrawImage(_bmp, new Rectangle(x, y, size, size));
+        if (_bmp == null || _bmp.Width != ClientSize.Width || _bmp.Height != ClientSize.Height) e.Graphics.Clear(Color.White);
+        if (_bmp != null) e.Graphics.DrawImageUnscaled(_bmp, 0, 0);
     }
 }
