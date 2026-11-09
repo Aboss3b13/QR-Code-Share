@@ -116,6 +116,7 @@ public sealed class FountainEncoder
     public int BlockSize { get; }
     public int BlockCount => _blocks.Length;
     public int PayloadLength => _payloadLength;
+    public uint TransferId => _transferId;
     public long FramesSent => _frame;
 
     public FountainEncoder(byte[] payload, int blockSize, uint transferId)
@@ -135,7 +136,18 @@ public sealed class FountainEncoder
         _repairSeed = (uint)k;
     }
 
-    public byte[] NextPacket()
+    public byte[] NextPacket() => BuildPacket(NextSeed());
+
+    /// <summary>Next packet without the QS header (grid mode carries that in its anchors).</summary>
+    public (uint seed, byte[] block) NextRaw()
+    {
+        uint seed = NextSeed();
+        var block = new byte[BlockSize];
+        XorBlocks(seed, block);
+        return (seed, block);
+    }
+
+    uint NextSeed()
     {
         int k = _blocks.Length;
         uint seed;
@@ -146,7 +158,7 @@ public sealed class FountainEncoder
             seed = m % 5 == 0 ? (uint)((m / 5) % k) : _repairSeed++;
         }
         _frame++;
-        return BuildPacket(seed);
+        return seed;
     }
 
     public byte[] BuildPacket(uint seed)
@@ -157,12 +169,16 @@ public sealed class FountainEncoder
         BinaryPrimitives.WriteInt32BigEndian(packet.AsSpan(8), _payloadLength);
         BinaryPrimitives.WriteUInt16BigEndian(packet.AsSpan(12), (ushort)BlockSize);
         BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(14), seed);
-        var data = packet.AsSpan(Protocol.HeaderSize);
+        XorBlocks(seed, packet.AsSpan(Protocol.HeaderSize));
+        return packet;
+    }
+
+    void XorBlocks(uint seed, Span<byte> data)
+    {
         foreach (int idx in Protocol.IndicesForSeed(seed, _blocks.Length))
         {
             var b = _blocks[idx];
             for (int i = 0; i < b.Length; i++) data[i] ^= b[i];
         }
-        return packet;
     }
 }

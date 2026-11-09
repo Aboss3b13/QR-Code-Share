@@ -96,3 +96,79 @@ least as many stored packets as unknown blocks exist, the remaining system is
 solved by Gaussian elimination over GF(2). When all `K` blocks are known
 the payload is truncated to `L`, parsed, decompressed and verified against the
 SHA-256. Packets with an unknown transfer id start a new transfer.
+
+---
+
+# Part B: Dense grid mode
+
+QR codes waste space on finder patterns, quiet zones and format information.
+Grid mode turns the whole screen into a grid of square **cells**, each one bit
+(dark = 1, light = 0), and only uses QR codes as small **anchors** that tell the
+receiver the geometry and where the grid is in the camera image.
+
+## B1. Layout
+
+* The sender picks a cell size in screen pixels (2 to 6) and fills its window
+  with `cols x rows` cells.
+* 9 anchors sit in a 3x3 arrangement (corners, edge centres, centre). Each is a
+  QR code version 2 (25 modules, EC level M) with a 3-module light quiet zone;
+  one module is `ams x ams` cells, so an anchor covers `31*ams` cells square.
+  Anchor x positions: `0, (cols-F)/2, cols-F`; y the same with `rows` (F = 31*ams).
+* All other cells are **data cells**. The rows are split into `bands`
+  horizontal bands (band `b` = rows `b*rows/bands ... (b+1)*rows/bands - 1`);
+  the data cells of a band are numbered row by row, left to right.
+
+## B2. Anchor content (23 bytes, Base45 text in the QR code)
+
+| Offset | Size | Field |
+| ------ | ---- | ----- |
+| 0 | 2 | magic `QG` |
+| 2 | 1 | grid format version = 1 |
+| 3 | 1 | anchor index 0-8 (row-major in the 3x3 arrangement) |
+| 4 | 4 | transfer id |
+| 8 | 4 | payload length `L` |
+| 12 | 2 | cols |
+| 14 | 2 | rows |
+| 16 | 1 | bits per cell (1) |
+| 17 | 1 | Reed-Solomon parity bytes per codeword `ec` |
+| 18 | 1 | codewords per packet `c` |
+| 19 | 1 | bands |
+| 20 | 1 | anchor module size in cells `ams` |
+| 21 | 2 | reserved, 0 |
+
+## B3. Band contents
+
+A band of `n` data cells carries `bytes = n/8` bytes, room for
+`P = floor(bytes / 255 / c)` packets.
+
+1. **Packet** (`c * (255-ec)` bytes): seed (uint32) · block data
+   (`B = c*(255-ec) - 8` bytes, the fountain block selected by the seed, same
+   rules as part A) · CRC-32 (IEEE) of seed + block.
+2. The packet is cut into `c` chunks of `255-ec` bytes; each becomes one
+   **Reed-Solomon codeword** over GF(256) (QR code field, polynomial 0x11D,
+   generator base 0) with `ec` parity bytes.
+3. **Interleaving:** the band's `N = P*c` codewords are written as
+   `stream[j*N + k] = codeword k, byte j`, so a damaged area spreads over all
+   codewords of the band. Unused bytes are 0.
+4. **Whitening:** the stream is XORed with the xorshift generator of part A
+   seeded with `0x51470000 + band` (4 bytes per `next()`, most significant
+   first). This keeps dark and light cells balanced for the receiver's
+   adaptive threshold.
+5. Bits are placed into the band's data cells, most significant bit first.
+
+Every band is self-contained: a rolling-shutter tear (camera catching two
+screen frames) or a reflection only costs the affected bands.
+
+## B4. Receiver
+
+1. Find anchors (ML Kit on a downscaled frame), then decode each anchor with
+   ZXing in the full-resolution frame to get its 3 finder centres and its
+   alignment centre: up to 36 precise grid-to-camera point pairs.
+2. Fit a homography (least squares), then a 3rd-degree polynomial on the
+   residuals to absorb lens distortion.
+3. Sample every data cell (5 points), compensate blur between neighbouring
+   cells, threshold against the local mean (17x17 cells).
+4. Per band: whitening off, de-interleave, Reed-Solomon decode, CRC check; good
+   packets go into the fountain decoder of part A.
+5. Track the anchors between frames so the expensive search only runs again
+   when tracking is lost.

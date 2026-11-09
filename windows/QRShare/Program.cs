@@ -90,12 +90,22 @@ static class Program
         Directory.CreateDirectory(outDir);
         for (int f = 0; f < frames; f++)
         {
-            var ms = new ZXing.Common.BitMatrix[p.Cols * p.Rows];
-            for (int i = 0; i < ms.Length; i++)
-                ms[i] = writer.encode(Protocol.Base45Encode(enc.NextPacket()), ZXing.BarcodeFormat.QR_CODE, 0, 0, hints);
-            using var bmp = MainForm.Compose(ms, p.Cols, p.Rows, 1920, 1080);
-            bmp.Save(Path.Combine(outDir, $"frame{f:D4}.png"), System.Drawing.Imaging.ImageFormat.Png);
-            if (f == 0) Console.WriteLine($"blocks={enc.BlockCount} modules={ms[0].Width - 8}");
+            System.Drawing.Bitmap bmp;
+            if (p.IsGrid)
+            {
+                var gp = MainForm.GridGeometry(p, enc, 1920, 1080)!;
+                bmp = MainForm.ComposeGrid(GridFormat.RenderFrame(gp, enc, writer), gp.Cols, gp.Rows, p.CellPx, 1920, 1080);
+                if (f == 0) Console.WriteLine($"blocks={enc.BlockCount} grid={gp.Cols}x{gp.Rows} bands={gp.Bands} blockSize={gp.BlockSize}");
+            }
+            else
+            {
+                var ms = new ZXing.Common.BitMatrix[p.Cols * p.Rows];
+                for (int i = 0; i < ms.Length; i++)
+                    ms[i] = writer.encode(Protocol.Base45Encode(enc.NextPacket()), ZXing.BarcodeFormat.QR_CODE, 0, 0, hints);
+                bmp = MainForm.Compose(ms, p.Cols, p.Rows, 1920, 1080);
+                if (f == 0) Console.WriteLine($"blocks={enc.BlockCount} modules={ms[0].Width - 8}");
+            }
+            using (bmp) bmp.Save(Path.Combine(outDir, $"frame{f:D4}.png"), System.Drawing.Imaging.ImageFormat.Png);
         }
         return 0;
     }

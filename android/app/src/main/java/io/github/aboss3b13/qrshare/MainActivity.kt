@@ -28,6 +28,7 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import io.github.aboss3b13.qrshare.databinding.ActivityMainBinding
+import io.github.aboss3b13.qrshare.protocol.GridFrameResult
 import io.github.aboss3b13.qrshare.protocol.ReceivedFile
 import io.github.aboss3b13.qrshare.protocol.TransferSession
 import java.util.Locale
@@ -37,7 +38,6 @@ import java.util.concurrent.Executors
 class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var cameraExecutor: ExecutorService
-    private lateinit var decodeExecutor: ExecutorService
     private val session = TransferSession()
     private lateinit var analyzer: QrAnalyzer
 
@@ -54,6 +54,7 @@ class MainActivity : AppCompatActivity() {
     private var lastRateFrames = 0L
     private var qrPerSec = 0.0
     private var framesPerSec = 0.0
+    @Volatile private var modeInfo = ""
 
     private val requestPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startCamera()
@@ -65,8 +66,7 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         cameraExecutor = Executors.newSingleThreadExecutor()
-        decodeExecutor = Executors.newSingleThreadExecutor()
-        analyzer = QrAnalyzer(decodeExecutor, ::onQrTexts)
+        analyzer = QrAnalyzer(::onQrTexts, ::onGridFrame)
 
         binding.againButton.setOnClickListener { receiveAnother() }
         binding.openButton.setOnClickListener { openFile() }
@@ -82,16 +82,16 @@ class MainActivity : AppCompatActivity() {
         providerFuture.addListener({
             val provider = providerFuture.get()
             val preview = Preview.Builder().build().also { it.setSurfaceProvider(binding.preview.surfaceProvider) }
-            // Full HD analysis: the sender packs several dense codes into one screen.
+            // As much resolution as the phone offers (up to 4K): the dense grid mode needs it.
             val builder = ImageAnalysis.Builder()
                 .setResolutionSelector(
                     ResolutionSelector.Builder()
-                        .setResolutionStrategy(ResolutionStrategy(Size(1920, 1080), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                        .setResolutionStrategy(ResolutionStrategy(Size(3840, 2160), ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER))
                         .build()
                 )
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            // Ask for a steady 30 fps so auto-exposure doesn't drop the frame rate indoors.
-            Camera2Interop.Extender(builder).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(30, 30))
+            // Ask for a high frame rate so auto-exposure doesn't drop it indoors.
+            Camera2Interop.Extender(builder).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(20, 30))
             val analysis = builder.build().also { it.setAnalyzer(cameraExecutor, analyzer) }
             try {
                 provider.unbindAll()
@@ -102,30 +102,48 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** Called on the decode thread with all QR codes found in one camera frame. */
+    /** QR mode: called on the camera thread with all QR codes found in one frame. */
     private fun onQrTexts(texts: List<String>) {
+        modeInfo = "QR mode · ${analyzer.frameSize}"
         for (text in texts) {
             if (paused) return
-            when (val ev = session.onQrText(text)) {
-                is TransferSession.Event.Progress -> {
-                    val now = SystemClock.elapsedRealtime()
-                    if (transferStart == 0L) transferStart = now
-                    qrCount++
-                    if (now - lastUiUpdate < 100) continue
-                    lastUiUpdate = now
-                    runOnUiThread { showProgress(ev, now) }
-                }
-                is TransferSession.Event.Completed -> {
-                    paused = true
-                    val file = ev.file
-                    runOnUiThread { onFileReceived(file) }
-                }
-                is TransferSession.Event.Failed -> runOnUiThread {
-                    Toast.makeText(this, "Transfer failed: ${ev.message}. Keep scanning to retry.", Toast.LENGTH_LONG).show()
-                    resetStats()
-                }
-                TransferSession.Event.Ignored -> {}
+            handle(session.onQrText(text))
+        }
+    }
+
+    /** Grid mode: called on the camera thread with the packets decoded from one frame. */
+    private fun onGridFrame(r: GridFrameResult) {
+        modeInfo = "Grid mode · ${analyzer.frameSize} · ${r.anchors.size}/9 anchors · bands ${r.bandsOk}/${r.bandsTotal}"
+        if (r.packets.isEmpty()) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastUiUpdate > 300) { lastUiUpdate = now; runOnUiThread { binding.hint.text = modeInfo } }
+        }
+        for (p in r.packets) {
+            if (paused) return
+            handle(session.onPacket(p))
+        }
+    }
+
+    private fun handle(ev: TransferSession.Event) {
+        when (ev) {
+            is TransferSession.Event.Progress -> {
+                val now = SystemClock.elapsedRealtime()
+                if (transferStart == 0L) transferStart = now
+                qrCount++
+                if (now - lastUiUpdate < 100) return
+                lastUiUpdate = now
+                runOnUiThread { showProgress(ev, now) }
             }
+            is TransferSession.Event.Completed -> {
+                paused = true
+                val file = ev.file
+                runOnUiThread { onFileReceived(file) }
+            }
+            is TransferSession.Event.Failed -> runOnUiThread {
+                Toast.makeText(this, "Transfer failed: ${ev.message}. Keep scanning to retry.", Toast.LENGTH_LONG).show()
+                resetStats()
+            }
+            TransferSession.Event.Ignored -> {}
         }
     }
 
@@ -151,10 +169,11 @@ class MainActivity : AppCompatActivity() {
         val remaining = maxOf(0.0, ev.total * 1.05 - ev.packets) * blockSize / maxOf(rate, 1.0)
         binding.detail.text = String.format(
             Locale.US,
-            "%s/s  ·  %s total  ·  ~%.0fs left\n%d codes read  ·  %.0f codes/s  ·  camera %.0f fps",
+            "%s/s  ·  %s total  ·  ~%.0fs left\n%d packets  ·  %.0f packets/s  ·  %.0f frames/s decoded",
             formatSize(rate.toLong()), formatSize(ev.payloadLength.toLong()), remaining,
             ev.packets, qrPerSec, framesPerSec,
         )
+        binding.hint.text = modeInfo
     }
 
     private fun onFileReceived(file: ReceivedFile) {
@@ -236,7 +255,6 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
-        decodeExecutor.shutdown()
         analyzer.close()
     }
 }

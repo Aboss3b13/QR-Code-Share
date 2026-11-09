@@ -8,8 +8,13 @@ using ZXing.QrCode.Internal;
 
 namespace QRShare;
 
-public sealed record SpeedPreset(string Name, int Cols, int Rows, int BlockSize, int Fps)
+/// <summary>A sender configuration. CellPx &gt; 0 selects the dense grid mode, otherwise QR codes.</summary>
+public sealed record SpeedPreset(string Name, int Cols, int Rows, int BlockSize, int Fps, int CellPx = 0, int Bpc = 1, int Ec = 32, int Ams = 1)
 {
+    public const int GridCwPerPacket = 2;
+    public bool IsGrid => CellPx > 0;
+    public static SpeedPreset Grid(string name, int cellPx, int ams, int ec, int fps) =>
+        new(name, 0, 0, GridFormat.BlockSizeFor(GridCwPerPacket, ec), fps, cellPx, 1, ec, ams);
     public override string ToString() => Name;
 }
 
@@ -17,18 +22,22 @@ public sealed class MainForm : Form
 {
     internal static readonly SpeedPreset[] Presets =
     {
-        new("Reliable — 1 code", 1, 1, 600, 10),
-        new("Fast — 4 codes", 2, 2, 900, 15),
-        new("Maximum — 6 codes", 3, 2, 1100, 20),
-        new("Extreme — 9 codes", 3, 3, 1000, 20),
+        new("QR · Reliable (1 code)", 1, 1, 600, 10),
+        new("QR · Fast (4 codes)", 2, 2, 900, 15),
+        new("QR · Maximum (6 codes)", 3, 2, 1100, 20),
+        SpeedPreset.Grid("Grid · Safe (6 px cells)", 6, 1, 48, 10),
+        SpeedPreset.Grid("Grid · Fast (4 px cells)", 4, 1, 32, 12),
+        SpeedPreset.Grid("Grid · Turbo (3 px cells, 4K camera)", 3, 2, 32, 12),
+        SpeedPreset.Grid("Grid · Extreme (2 px cells, 4K camera)", 2, 3, 32, 12),
     };
+    internal const int DefaultPreset = 4;
 
     readonly byte[] _payload;
     readonly long _originalSize;
     volatile FountainEncoder _encoder;
 
     readonly QrView _view = new() { Dock = DockStyle.Fill };
-    readonly ComboBox _preset = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 170 };
+    readonly ComboBox _preset = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 250 };
     readonly NumericUpDown _cols = new() { Minimum = 1, Maximum = 6, Value = 2, Width = 40 };
     readonly NumericUpDown _rows = new() { Minimum = 1, Maximum = 4, Value = 2, Width = 40 };
     readonly NumericUpDown _fps = new() { Minimum = 1, Maximum = 30, Value = 15, Width = 50 };
@@ -40,6 +49,8 @@ public sealed class MainForm : Form
 
     // Snapshot of the settings, read by the render thread.
     volatile int _cfgCols = 2, _cfgRows = 2, _cfgFps = 15;
+    volatile SpeedPreset _cfgPreset = Presets[DefaultPreset];
+    volatile int _frameBytes;
     volatile bool _paused, _running = true;
     volatile int _viewW, _viewH;
     long _framesShown;
@@ -86,7 +97,7 @@ public sealed class MainForm : Form
         _view.Resize += (_, _) => { _viewW = _view.ClientSize.Width; _viewH = _view.ClientSize.Height; };
         KeyDown += OnKey;
 
-        _preset.SelectedIndex = 1;
+        _preset.SelectedIndex = DefaultPreset;
         _viewW = _view.ClientSize.Width; _viewH = _view.ClientSize.Height;
 
         var ui = new System.Windows.Forms.Timer { Interval = 250 };
@@ -107,8 +118,13 @@ public sealed class MainForm : Form
 
     void ApplyPreset(SpeedPreset p)
     {
-        _cols.Value = p.Cols; _rows.Value = p.Rows; _fps.Value = p.Fps;
+        _cfgPreset = p;
+        _cols.Enabled = _rows.Enabled = _block.Enabled = !p.IsGrid;
+        if (!p.IsGrid) { _cols.Value = p.Cols; _rows.Value = p.Rows; }
+        _fps.Value = p.Fps;
+        bool changed = _block.Value != p.BlockSize;
         _block.Value = p.BlockSize; // fires SettingsChanged(true) if it differs
+        if (!changed) { _encoder = NewEncoder(); _clock.Restart(); }
         SettingsChanged(false);
     }
 
@@ -174,11 +190,26 @@ public sealed class MainForm : Form
 
             int cols = _cfgCols, rows = _cfgRows, w = _viewW, h = _viewH;
             var enc = _encoder;
-            var matrices = new BitMatrix[cols * rows];
-            for (int i = 0; i < matrices.Length; i++)
-                matrices[i] = writer.encode(Protocol.Base45Encode(enc.NextPacket()), BarcodeFormat.QR_CODE, 0, 0, hints);
-            var bmp = Compose(matrices, cols, rows, w, h);
-            _qrModules = matrices[0].Width - 8;
+            var preset = _cfgPreset;
+            Bitmap bmp;
+            if (preset.IsGrid && enc.BlockSize == preset.BlockSize)
+            {
+                var p = GridGeometry(preset, enc, w, h);
+                if (p == null) { Thread.Sleep(50); continue; }
+                bmp = ComposeGrid(GridFormat.RenderFrame(p, enc, writer), p.Cols, p.Rows, preset.CellPx, w, h);
+                _frameBytes = GridFormat.BandCells(p.Cols, p.Rows, p.Bands, GridFormat.AnchorMask(p.Cols, p.Rows, p.Ams))
+                    .Sum(c => GridFormat.PacketsInBand(c.Length, p.Bpc, p.CwPerPacket)) * p.BlockSize;
+                _qrModules = 0;
+            }
+            else
+            {
+                var matrices = new BitMatrix[cols * rows];
+                for (int i = 0; i < matrices.Length; i++)
+                    matrices[i] = writer.encode(Protocol.Base45Encode(enc.NextPacket()), BarcodeFormat.QR_CODE, 0, 0, hints);
+                bmp = Compose(matrices, cols, rows, w, h);
+                _qrModules = matrices[0].Width - 8;
+                _frameBytes = matrices.Length * enc.BlockSize;
+            }
 
             double interval = 1000.0 / Math.Max(1, _cfgFps);
             double now = timer.Elapsed.TotalMilliseconds;
@@ -192,6 +223,43 @@ public sealed class MainForm : Form
             catch (ObjectDisposedException) { return; }
             catch (InvalidOperationException) { return; }
         }
+    }
+
+    /// <summary>Grid geometry for a screen area, or null if the area is too small.</summary>
+    internal static GridParams? GridGeometry(SpeedPreset preset, FountainEncoder enc, int w, int h)
+    {
+        int cols = w / preset.CellPx, rows = h / preset.CellPx;
+        if (cols < GridFormat.MinCols(preset.Ams) || rows < GridFormat.MinRows(preset.Ams)) return null;
+        int bands = GridFormat.ChooseBands(cols, rows, preset.Bpc, SpeedPreset.GridCwPerPacket, preset.Ams);
+        return new GridParams(enc.TransferId, enc.PayloadLength, cols, rows, preset.Bpc, preset.Ec, SpeedPreset.GridCwPerPacket, bands, preset.Ams);
+    }
+
+    /// <summary>Draws grid cells (intensity per cell) as cellPx-sized squares, centred.</summary>
+    internal static unsafe Bitmap ComposeGrid(byte[] cells, int cols, int rows, int cellPx, int w, int h)
+    {
+        var bmp = new Bitmap(w, h, PixelFormat.Format32bppRgb);
+        var data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
+        try
+        {
+            byte* basePtr = (byte*)data.Scan0;
+            for (int y = 0; y < h; y++) new Span<uint>(basePtr + y * data.Stride, w).Fill(0xFFFFFFFFu);
+            int ox = (w - cols * cellPx) / 2, oy = (h - rows * cellPx) / 2;
+            for (int r = 0; r < rows; r++)
+            {
+                for (int dy = 0; dy < cellPx; dy++)
+                {
+                    uint* row = (uint*)(basePtr + (oy + r * cellPx + dy) * data.Stride) + ox;
+                    for (int c = 0; c < cols; c++)
+                    {
+                        uint v = cells[r * cols + c];
+                        uint px = 0xFF000000u | (v << 16) | (v << 8) | v;
+                        for (int dx = 0; dx < cellPx; dx++) row[c * cellPx + dx] = px;
+                    }
+                }
+            }
+        }
+        finally { bmp.UnlockBits(data); }
+        return bmp;
     }
 
     /// <summary>Lays the QR codes out in a grid, each drawn with whole-pixel modules.</summary>
@@ -238,11 +306,11 @@ public sealed class MainForm : Form
     void UpdateStatus()
     {
         var enc = _encoder;
-        int perFrame = _cfgCols * _cfgRows;
-        double nominal = perFrame * enc.BlockSize * (double)_cfgFps;
-        double firstPass = enc.BlockCount / (double)(perFrame * _cfgFps);
-        _status.Text = $"{FormatSize(_originalSize)} → {enc.BlockCount} blocks  ·  {perFrame} codes × {enc.BlockSize} B × {_cfgFps} fps = {FormatSize((long)nominal)}/s max  ·  " +
-                       $"QR {_qrModules}×{_qrModules}  ·  best case ≈ {firstPass:0}s  ·  frame {_framesShown}  ·  Space = pause, F11 = fullscreen";
+        double nominal = _frameBytes * (double)_cfgFps;
+        double firstPass = nominal > 0 ? enc.BlockCount * (double)enc.BlockSize / nominal : 0;
+        string what = _cfgPreset.IsGrid ? $"grid {_cfgPreset.CellPx}px cells" : $"{_cfgCols * _cfgRows} × QR {_qrModules}×{_qrModules}";
+        _status.Text = $"{FormatSize(_originalSize)} → {enc.BlockCount} blocks  ·  {what}  ·  {FormatSize(_frameBytes)}/frame × {_cfgFps} fps = {FormatSize((long)nominal)}/s max  ·  " +
+                       $"best case ≈ {firstPass:0}s  ·  frame {_framesShown}  ·  Space = pause, F11 = fullscreen";
     }
 
     static string FormatSize(long b) => b switch

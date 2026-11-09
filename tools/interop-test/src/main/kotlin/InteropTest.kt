@@ -18,10 +18,11 @@ import kotlin.random.Random
  *                                                all QR codes in it are decoded.
  */
 fun main(args: Array<String>) {
-    val original = File(args[2]).readBytes()
+    val original = if (args[0] == "grid") ByteArray(0) else File(args[2]).readBytes()
     when (args[0]) {
         "lines" -> lines(File(args[1]), original, args.getOrNull(3)?.toDouble() ?: 0.3)
         "frames" -> frames(File(args[1]), original, args.getOrNull(3)?.toDouble() ?: 0.85)
+        "grid" -> gridSim(args.drop(1))
         else -> error("unknown mode")
     }
 }

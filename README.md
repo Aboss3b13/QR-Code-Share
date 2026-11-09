@@ -27,25 +27,29 @@ ask you to allow installing apps from your browser once.
 
 ### Speed
 
-The sender shows a **grid of QR codes** that changes many times per second; the
-phone reads all codes in each camera frame with Google ML Kit (on-device,
-offline). Pick a preset in the *Speed* box:
+Pick a preset in the *Speed* box of the sender. The phone detects the mode by
+itself.
 
-| Preset | Codes per frame | Bytes per code | Frames/s | Max. throughput |
-| ------ | --------------- | -------------- | -------- | --------------- |
-| Reliable | 1 | 600 | 10 | 6 KB/s |
-| Fast (default) | 4 (2×2) | 900 | 15 | 54 KB/s |
-| Maximum | 6 (3×2) | 1100 | 20 | 132 KB/s |
-| Extreme | 9 (3×3) | 1000 | 20 | 180 KB/s (experimental) |
+**Grid mode** (fastest): the whole screen becomes a grid of tiny black/white
+cells, with 9 small QR codes as anchors. The phone films it at up to 4K.
 
-Real speed is lower: it depends on how many codes per second the phone actually
-reads (shown live on the phone). For the best results press **F11** for
-fullscreen, set the laptop brightness to maximum, and hold the phone so the
-screen fills the camera view. If progress stalls, step down one preset.
+| Preset | Cell size | Data per frame (1080p screen) | Max. throughput | Phone camera |
+| ------ | --------- | ----------------------------- | --------------- | ------------ |
+| Grid · Safe | 6 px | ~4.5 KB | ~45 KB/s | 1080p is enough |
+| Grid · Fast (default) | 4 px | ~12 KB | ~150 KB/s | 1080p is enough |
+| Grid · Turbo | 3 px | ~20 KB | ~240 KB/s | needs 4K |
+| Grid · Extreme | 2 px | ~42 KB | ~500 KB/s | needs 4K |
 
-Physical limit: a phone camera records ~30 frames/s, and screen-to-camera links
-top out around 100–200 KB/s even in research systems, so 1 MB/s is not
-reachable with a camera alone.
+**QR mode** (most compatible): a grid of 1-6 normal QR codes, ~6-130 KB/s.
+
+Real speed depends on your phone: watch the live KB/s on the phone. Tips: press
+**F11** for fullscreen, laptop brightness to maximum, hold the phone steady so
+the screen fills the camera view (all 9 anchors visible), avoid reflections. If
+nothing happens, step down one preset or switch to a QR preset.
+
+Measured in a camera simulation (perspective, lens distortion, blur, noise,
+rolling-shutter tears on every 2nd frame): Grid · Extreme rebuilt a 400 KB file
+from 16 simulated 4K camera frames. Not yet measured on a real phone.
 
 ## How it works
 
@@ -66,7 +70,7 @@ or receivers (iOS, Linux, web) can be written against it.
 | ---- | -------- |
 | `android/` | Kotlin receiver app (CameraX + ZXing) |
 | `windows/QRShare/` | C# / WinForms sender (ZXing.Net) with Explorer integration |
-| `tools/interop-test/` | Runs the Android decoder on the JVM against packets exported by the Windows sender |
+| `tools/interop-test/` | Runs the Android decoder on the JVM against frames exported by the Windows sender, including a camera simulation (`CameraSim.kt`) |
 | `.github/workflows/build.yml` | Builds the APK and EXE and publishes a GitHub release on every push to `main` |
 
 ### Build locally

@@ -20,6 +20,11 @@ class TransferSession {
     @Synchronized
     fun onQrText(text: String): Event {
         val packet = Packet.parseText(text) ?: return Event.Ignored
+        return onPacket(packet)
+    }
+
+    @Synchronized
+    fun onPacket(packet: Packet): Event {
         if (packet.transferId in finishedTransfers) return Event.Ignored
         var d = decoder
         if (d == null || d.transferId != packet.transferId || d.blockSize != packet.blockSize) {
