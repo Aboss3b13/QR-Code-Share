@@ -20,7 +20,10 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.annotation.OptIn
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -54,6 +57,18 @@ class MainActivity : AppCompatActivity() {
     private var lastRateFrames = 0L
     private var qrPerSec = 0.0
     private var framesPerSec = 0.0
+    private var camera: Camera? = null
+
+    // Grid diagnostics (camera thread)
+    private var gridFrames = 0
+    private var gridFramesAtLast = 0
+    private var gridRateTime = 0L
+    private var gridFps = 0.0
+    private var bandsOkSum = 0
+    private var bandsTotalSum = 0
+    private var bandRate = 0.0
+    private var lastExposureChange = 0L
+    @Volatile private var evIndex = 0
     @Volatile private var modeInfo = ""
 
     private val requestPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -95,7 +110,9 @@ class MainActivity : AppCompatActivity() {
             val analysis = builder.build().also { it.setAnalyzer(cameraExecutor, analyzer) }
             try {
                 provider.unbindAll()
-                provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+                val cam = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+                camera = cam
+                setupExposure(cam)
             } catch (e: Exception) {
                 binding.status.text = "Could not start camera: ${e.message}"
             }
@@ -113,7 +130,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Grid mode: called on the camera thread with the packets decoded from one frame. */
     private fun onGridFrame(r: GridFrameResult) {
-        modeInfo = "Grid mode · ${analyzer.frameSize} · ${r.anchors.size}/9 anchors · bands ${r.bandsOk}/${r.bandsTotal}"
+        updateGridDiagnostics(r)
         if (r.packets.isEmpty()) {
             val now = SystemClock.elapsedRealtime()
             if (now - lastUiUpdate > 300) { lastUiUpdate = now; runOnUiThread { binding.hint.text = modeInfo } }
@@ -240,6 +257,72 @@ class MainActivity : AppCompatActivity() {
         binding.status.text = "Waiting for QR code…"
         binding.detail.text = " "
         paused = false
+    }
+
+    /**
+     * A laptop screen is by far the brightest thing in view, so normal auto-exposure
+     * overexposes it: white cells clip and bleed into black ones, and long exposures smear
+     * the cells when the hand shakes. Start darker and meter on the centre of the view.
+     */
+    private fun setupExposure(cam: Camera) {
+        val state = cam.cameraInfo.exposureState
+        if (state.isExposureCompensationSupported) {
+            val step = state.exposureCompensationStep.toFloat()
+            val idx = Math.round(-1.0f / step).coerceIn(state.exposureCompensationRange.lower, state.exposureCompensationRange.upper)
+            evIndex = idx
+            cam.cameraControl.setExposureCompensationIndex(idx)
+        }
+        try {
+            val point = SurfaceOrientedMeteringPointFactory(1f, 1f).createPoint(0.5f, 0.5f, 0.6f)
+            cam.cameraControl.startFocusAndMetering(
+                FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                    .disableAutoCancel().build()
+            )
+        } catch (_: Exception) {
+        }
+    }
+
+    /** Nudges exposure compensation so white cells sit around 200 without clipping. */
+    private fun autoExposure(r: GridFrameResult, now: Long) {
+        val cam = camera ?: return
+        if (r.anchors.size < 4 || now - lastExposureChange < 700) return
+        val state = cam.cameraInfo.exposureState
+        if (!state.isExposureCompensationSupported) return
+        val range = state.exposureCompensationRange
+        val target = when {
+            r.clipped > 0.02f || r.lightLevel > 235f -> evIndex - 1
+            r.lightLevel < 140f && r.clipped < 0.003f -> evIndex + 1
+            else -> return
+        }.coerceIn(range.lower, range.upper)
+        if (target == evIndex) return
+        evIndex = target
+        lastExposureChange = now
+        cam.cameraControl.setExposureCompensationIndex(target)
+    }
+
+    private fun updateGridDiagnostics(r: GridFrameResult) {
+        val now = SystemClock.elapsedRealtime()
+        gridFrames++
+        bandsOkSum += r.bandsOk; bandsTotalSum += r.bandsTotal
+        if (now - gridRateTime >= 1000) {
+            if (gridRateTime != 0L) gridFps = (gridFrames - gridFramesAtLast) * 1000.0 / (now - gridRateTime)
+            bandRate = if (bandsTotalSum > 0) bandsOkSum * 100.0 / bandsTotalSum else 0.0
+            gridRateTime = now; gridFramesAtLast = gridFrames; bandsOkSum = 0; bandsTotalSum = 0
+        }
+        autoExposure(r, now)
+        val ev = camera?.cameraInfo?.exposureState?.let { evIndex * it.exposureCompensationStep.toFloat() } ?: 0f
+        val tip = when {
+            r.anchors.size < 9 -> "Tip: move back or re-aim so all 9 small squares are inside the camera view."
+            r.clipped > 0.02f -> "Tip: the screen looks over-exposed; adjusting exposure…"
+            bandRate < 40 && gridFps > 0 -> "Tip: cells too small for this camera/distance. Move closer, hold steadier, or pick a bigger-cell preset."
+            else -> "Tip: if the laptop shows more frames/s than ${"%.0f".format(Locale.US, gridFps)}, lower its Frames/s to match."
+        }
+        modeInfo = String.format(
+            Locale.US,
+            "Grid · %s · %d/9 anchors · bands ok %.0f%%\nphone decodes %.1f frames/s (%d ms) · white %d · black %d · clipped %.0f%% · EV %+.1f\n%s",
+            analyzer.frameSize, r.anchors.size, bandRate, gridFps, analyzer.lastFrameMs,
+            r.lightLevel.toInt(), r.darkLevel.toInt(), r.clipped * 100, ev, tip,
+        )
     }
 
     private fun resetStats() {

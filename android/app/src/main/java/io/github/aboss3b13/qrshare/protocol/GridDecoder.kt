@@ -38,6 +38,13 @@ class GridFrameResult(
     val bandsOk: Int,
     val bandsTotal: Int,
     val anchors: List<AnchorHit>,
+    /** Average camera brightness of light / dark cells (0-255). */
+    val lightLevel: Float = 0f,
+    val darkLevel: Float = 0f,
+    /** Share of cells at or near 255, i.e. over-exposed. */
+    val clipped: Float = 0f,
+    /** Time spent decoding this frame. */
+    val decodeMs: Long = 0,
 )
 
 /**
@@ -45,8 +52,8 @@ class GridFrameResult(
  * same code runs in the Android app and in the desktop camera-simulation test.
  */
 class GridDecoder(
-    /** Sample points at the cell centre and +-offset (in cells). */
-    private val sampleOffset: Double = 0.1,
+    /** 0 = one sample at the cell centre; otherwise also 4 samples at +-offset (in cells). */
+    private val sampleOffset: Double = 0.0,
     /** Strength of the neighbour-bleed (blur) compensation. */
     private val sharpen: Float = 0.65f,
 ) {
@@ -105,6 +112,7 @@ class GridDecoder(
 
     /** Decodes the data cells of a frame, given at least 4 anchors of the same transfer. */
     fun decodeFrame(frame: LumaFrame, hits: List<AnchorHit>): GridFrameResult {
+        val t0 = System.nanoTime()
         val groups = hits.groupBy { it.header.copy(anchorIndex = 0) }
         val best = groups.maxByOrNull { it.value.distinctBy { h -> h.header.anchorIndex }.size }?.value
         val anchors = best?.distinctBy { it.header.anchorIndex } ?: emptyList()
@@ -127,7 +135,26 @@ class GridDecoder(
                 if (got.second) bandsOk++
             }
         }
-        return GridFrameResult(h, packets, bandsOk, h.bands, anchors)
+        // Exposure statistics (raw samples, before blur compensation).
+        var lightSum = 0.0; var lightN = 0; var darkSum = 0.0; var darkN = 0; var clip = 0; var n = 0
+        val raw = rawSamples
+        var i = 0
+        while (i < raw.size) {
+            val v = raw[i]
+            if (!mask[i] && !v.isNaN()) {
+                n++
+                if (v >= 250f) clip++
+                if (v > mean[i]) { lightSum += v; lightN++ } else { darkSum += v; darkN++ }
+            }
+            i += 7
+        }
+        return GridFrameResult(
+            h, packets, bandsOk, h.bands, anchors,
+            lightLevel = if (lightN > 0) (lightSum / lightN).toFloat() else 0f,
+            darkLevel = if (darkN > 0) (darkSum / darkN).toFloat() else 0f,
+            clipped = if (n > 0) clip.toFloat() / n else 0f,
+            decodeMs = (System.nanoTime() - t0) / 1_000_000,
+        )
     }
 
     private fun ensureLayout(h: GridHeader) {
@@ -137,27 +164,47 @@ class GridDecoder(
         layoutKey = h
     }
 
-    /** Average brightness at 5 points inside each cell (NaN if outside the image). */
+    private var rawSamples = FloatArray(0)
+
+    /**
+     * Brightness at each cell centre (NaN if outside the image). The grid->camera mapping is
+     * evaluated on a coarse mesh (every 8 cells) and interpolated, which is ~20x cheaper
+     * than mapping every cell and far below a tenth of a pixel off.
+     */
     private fun sampleCells(frame: LumaFrame, h: GridHeader, m: GridMapping): FloatArray {
         val out = FloatArray(h.cols * h.rows)
+        val step = 8
+        val lc = h.cols / step + 2; val lr = h.rows / step + 2
+        val lx = DoubleArray(lc * lr); val ly = DoubleArray(lc * lr)
+        val pt = DoubleArray(2)
+        for (j in 0 until lr) for (i in 0 until lc) {
+            m.map((i * step).toDouble(), (j * step).toDouble(), pt)
+            lx[j * lc + i] = pt[0]; ly[j * lc + i] = pt[1]
+        }
         val o = sampleOffset
-        val offs = arrayOf(doubleArrayOf(0.0, 0.0), doubleArrayOf(-o, -o), doubleArrayOf(o, -o), doubleArrayOf(-o, o), doubleArrayOf(o, o))
+        val offs = if (o == 0.0) arrayOf(doubleArrayOf(0.0, 0.0))
+        else arrayOf(doubleArrayOf(0.0, 0.0), doubleArrayOf(-o, -o), doubleArrayOf(o, -o), doubleArrayOf(-o, o), doubleArrayOf(o, o))
         IntStream.range(0, h.rows).parallel().forEach { r ->
-            val pt = DoubleArray(2)
             for (c in 0 until h.cols) {
                 val idx = r * h.cols + c
                 if (mask[idx]) continue
                 var sum = 0.0
                 var ok = true
                 for (d in offs) {
-                    m.map(c + 0.5 + d[0], r + 0.5 + d[1], pt)
-                    val v = bilinear(frame, pt[0], pt[1])
+                    val gu = (c + 0.5 + d[0]) / step; val gv = (r + 0.5 + d[1]) / step
+                    val i0 = gu.toInt(); val j0 = gv.toInt()
+                    val fu = gu - i0; val fv = gv - j0
+                    val a = j0 * lc + i0
+                    val x = (lx[a] * (1 - fu) + lx[a + 1] * fu) * (1 - fv) + (lx[a + lc] * (1 - fu) + lx[a + lc + 1] * fu) * fv
+                    val y = (ly[a] * (1 - fu) + ly[a + 1] * fu) * (1 - fv) + (ly[a + lc] * (1 - fu) + ly[a + lc + 1] * fu) * fv
+                    val v = bilinear(frame, x, y)
                     if (v < 0) { ok = false; break }
                     sum += v
                 }
                 out[idx] = if (ok) (sum / offs.size).toFloat() else Float.NaN
             }
         }
+        rawSamples = out
         return if (sharpen > 0) sharpenCells(out, h) else out
     }
 

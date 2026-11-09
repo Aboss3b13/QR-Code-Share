@@ -88,7 +88,7 @@ fun gridSim(args: List<String>) {
         Box(pts.minOf { it[0] }.toInt(), pts.minOf { it[1] }.toInt(), pts.maxOf { it[0] }.toInt(), pts.maxOf { it[1] }.toInt()).expanded(0.3, cw, ch)
     }
 
-    val decoder = GridDecoder(System.getenv("QS_OFF")?.toDouble() ?: 0.1, System.getenv("QS_SHARP")?.toFloat() ?: 0.65f)
+    val decoder = GridDecoder(System.getenv("QS_OFF")?.toDouble() ?: 0.0, System.getenv("QS_SHARP")?.toFloat() ?: 0.65f)
     val tracker = AnchorTracker()
     val session = TransferSession()
     var packets = 0; var bandsOk = 0; var bandsTotal = 0; var decodeMs = 0L
@@ -124,7 +124,7 @@ fun gridSim(args: List<String>) {
             }
             println("frame $i: cell error rate ${err * 100.0 / n}%")
         }
-        if (i < 3) println("frame $i: anchors=${r.anchors.size} bands ${r.bandsOk}/${r.bandsTotal} packets=${r.packets.size}")
+        if (i < 3) println("frame $i: anchors=${r.anchors.size} bands ${r.bandsOk}/${r.bandsTotal} packets=${r.packets.size} light=${r.lightLevel.toInt()} dark=${r.darkLevel.toInt()} clipped=${(r.clipped * 100).toInt()}% decode=${r.decodeMs}ms")
         for (p in r.packets) {
             packets++
             val ev = session.onPacket(p)

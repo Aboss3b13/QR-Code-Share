@@ -51,6 +51,21 @@ Measured in a camera simulation (perspective, lens distortion, blur, noise,
 rolling-shutter tears on every 2nd frame): Grid · Extreme rebuilt a 400 KB file
 from 16 simulated 4K camera frames. Not yet measured on a real phone.
 
+### If it's slow: read the phone's diagnostics
+
+In grid mode the phone shows a live line such as
+`Grid · 3840×2160 · 9/9 anchors · bands ok 92% · phone decodes 11.5 frames/s (70 ms) · white 205 · black 48 · clipped 0% · EV -1.0`.
+
+| What you see | What it means | What to do |
+| ------------ | ------------- | ---------- |
+| fewer than 9/9 anchors | part of the grid is outside the view | move back / re-aim until all 9 small squares are visible |
+| clipped above 2% | screen is over-exposed, white bleeds into black | the app lowers exposure automatically; also lower laptop brightness a bit if it stays high |
+| bands ok below ~50% | cells are too small/blurry for this camera | move closer, hold steadier (rest your elbows), or pick a bigger-cell preset |
+| bands ok high, speed still low | phone decodes fewer frames/s than the laptop shows | set laptop *Frames/s* to about the phone's "decodes … frames/s" |
+| resolution 1920×1080 | the phone does not give apps 4K frames | Turbo/Extreme won't work; use Grid · Fast |
+
+The laptop status bar shows how many frames/s it really displays.
+
 ## How it works
 
 * The file is compressed (zlib, only when it helps), wrapped with name, size

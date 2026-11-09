@@ -173,11 +173,42 @@ public static class GridFormat
     }
 
     /// <summary>Renders a full frame as cell intensities (0 = black, 255 = white).</summary>
+    static (GridParams key, byte[] cells, int[][] bands)? _template;
+
     public static byte[] RenderFrame(GridParams p, FountainEncoder enc, QRCodeWriter writer)
+    {
+        // Anchors and band layout only change with the geometry: build them once.
+        var t = _template;
+        if (t == null || t.Value.key != p)
+        {
+            var mask0 = AnchorMask(p.Cols, p.Rows, p.Ams);
+            t = (p, RenderAnchors(p, writer), BandCells(p.Cols, p.Rows, p.Bands, mask0));
+            _template = t;
+        }
+        var cells = (byte[])t.Value.cells.Clone();
+        var bands = t.Value.bands;
+        int maxLevel = (1 << p.Bpc) - 1;
+        // Packets must be drawn from the encoder in order; encoding the bands can run in parallel.
+        var packets = new List<(uint, byte[])>[bands.Length];
+        for (int b = 0; b < bands.Length; b++)
+        {
+            int np = PacketsInBand(bands[b].Length, p.Bpc, p.CwPerPacket);
+            packets[b] = new List<(uint, byte[])>(np);
+            for (int i = 0; i < np; i++) packets[b].Add(enc.NextRaw());
+        }
+        Parallel.For(0, bands.Length, b =>
+        {
+            int next = 0;
+            var levels = EncodeBand(p, b, bands[b].Length, () => packets[b][next++]);
+            for (int i = 0; i < levels.Length; i++) cells[bands[b][i]] = (byte)(levels[i] * 255 / maxLevel);
+        });
+        return cells;
+    }
+
+    static byte[] RenderAnchors(GridParams p, QRCodeWriter writer)
     {
         var cells = new byte[p.Cols * p.Rows];
         Array.Fill(cells, (byte)255);
-        var mask = AnchorMask(p.Cols, p.Rows, p.Ams);
         var hints = new Dictionary<EncodeHintType, object>
         {
             [EncodeHintType.ERROR_CORRECTION] = ErrorCorrectionLevel.M,
@@ -197,13 +228,6 @@ public static class GridFormat
                         for (int dy = 0; dy < ams; dy++)
                             for (int dx = 0; dx < ams; dx++)
                                 cells[(ay + q + y * ams + dy) * p.Cols + ax + q + x * ams + dx] = 0;
-        }
-        int maxLevel = (1 << p.Bpc) - 1;
-        var bands = BandCells(p.Cols, p.Rows, p.Bands, mask);
-        for (int b = 0; b < bands.Length; b++)
-        {
-            var levels = EncodeBand(p, b, bands[b].Length, enc.NextRaw);
-            for (int i = 0; i < levels.Length; i++) cells[bands[b][i]] = (byte)(levels[i] * 255 / maxLevel);
         }
         return cells;
     }

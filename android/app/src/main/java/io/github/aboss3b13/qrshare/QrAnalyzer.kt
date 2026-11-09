@@ -42,8 +42,12 @@ class QrAnalyzer(
         private set
     @Volatile var frameSize = ""
         private set
+    /** Total processing time of the last frame (copy, anchors, cells, decode). */
+    @Volatile var lastFrameMs = 0L
+        private set
 
     override fun analyze(image: ImageProxy) {
+        val t0 = System.nanoTime()
         try {
             val frame = copyLuma(image)
             frameSize = "${frame.width}×${frame.height}"
@@ -51,6 +55,7 @@ class QrAnalyzer(
 
             if (tracker.locked) {
                 val r = grid.decodeFrame(frame, grid.decodeAnchors(frame, tracker.trackedBoxes()))
+                lastFrameMs = (System.nanoTime() - t0) / 1_000_000
                 if (r.anchors.size >= 4) {
                     tracker.update(r.anchors)
                     onGrid(r)
@@ -62,6 +67,7 @@ class QrAnalyzer(
         } catch (_: Exception) {
         } finally {
             image.close()
+            lastFrameMs = (System.nanoTime() - t0) / 1_000_000
         }
     }
 

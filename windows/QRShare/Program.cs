@@ -11,6 +11,8 @@ static class Program
         // Headless helper used by the interop test: QRShare.exe --export-packets <file> <out> <count> <blockSize>
         if (args.Length == 5 && args[0] == "--export-packets")
             return ExportPackets(args[1], args[2], int.Parse(args[3]), int.Parse(args[4]));
+        // QRShare.exe --bench <presetIndex>  (render speed of the sender, prints ms per frame)
+        if (args.Length == 2 && args[0] == "--bench") return Bench(MainForm.Presets[int.Parse(args[1])]);
         // QRShare.exe --export-frames <file> <outDir> <frames> <presetIndex>  (renders 1920x1080 PNGs)
         if (args.Length == 5 && args[0] == "--export-frames")
             return ExportFrames(args[1], args[2], int.Parse(args[3]), MainForm.Presets[int.Parse(args[4])]);
@@ -74,6 +76,22 @@ static class Program
         using var w = new StreamWriter(outPath);
         for (int i = 0; i < count; i++) w.WriteLine(Protocol.Base45Encode(enc.NextPacket()));
         Console.WriteLine($"payload={payload.Length} blocks={enc.BlockCount}");
+        return 0;
+    }
+
+    static int Bench(SpeedPreset p)
+    {
+        var payload = new byte[2_000_000]; Random.Shared.NextBytes(payload);
+        var enc = new FountainEncoder(payload, p.BlockSize, 1);
+        var writer = new ZXing.QrCode.QRCodeWriter();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        int n = 40;
+        for (int f = 0; f < n; f++)
+        {
+            var gp = MainForm.GridGeometry(p, enc, 1920, 1080)!;
+            using var bmp = MainForm.ComposeGrid(GridFormat.RenderFrame(gp, enc, writer), gp.Cols, gp.Rows, p.CellPx, 1920, 1080);
+        }
+        File.WriteAllText("bench.txt", $"{p.Name}: {sw.Elapsed.TotalMilliseconds / n:0.0} ms/frame");
         return 0;
     }
 

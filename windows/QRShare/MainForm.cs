@@ -244,11 +244,13 @@ public sealed class MainForm : Form
             byte* basePtr = (byte*)data.Scan0;
             for (int y = 0; y < h; y++) new Span<uint>(basePtr + y * data.Stride, w).Fill(0xFFFFFFFFu);
             int ox = (w - cols * cellPx) / 2, oy = (h - rows * cellPx) / 2;
-            for (int r = 0; r < rows; r++)
+            nint scan0 = data.Scan0; int stride = data.Stride;
+            Parallel.For(0, rows, r =>
             {
+                byte* bp = (byte*)scan0;
                 for (int dy = 0; dy < cellPx; dy++)
                 {
-                    uint* row = (uint*)(basePtr + (oy + r * cellPx + dy) * data.Stride) + ox;
+                    uint* row = (uint*)(bp + (oy + r * cellPx + dy) * stride) + ox;
                     for (int c = 0; c < cols; c++)
                     {
                         uint v = cells[r * cols + c];
@@ -256,7 +258,7 @@ public sealed class MainForm : Form
                         for (int dx = 0; dx < cellPx; dx++) row[c * cellPx + dx] = px;
                     }
                 }
-            }
+            });
         }
         finally { bmp.UnlockBits(data); }
         return bmp;
@@ -303,14 +305,22 @@ public sealed class MainForm : Form
         return bmp;
     }
 
+    long _lastFrames; double _lastStatusSec, _achievedFps;
     void UpdateStatus()
     {
+        double nowSec = _clock.Elapsed.TotalSeconds + 0; // clock restarts on encoder change; guard below
+        double dt = nowSec - _lastStatusSec;
+        if (dt >= 1 || dt < 0)
+        {
+            if (dt > 0) _achievedFps = (_framesShown - _lastFrames) / dt;
+            _lastFrames = _framesShown; _lastStatusSec = nowSec;
+        }
         var enc = _encoder;
         double nominal = _frameBytes * (double)_cfgFps;
         double firstPass = nominal > 0 ? enc.BlockCount * (double)enc.BlockSize / nominal : 0;
         string what = _cfgPreset.IsGrid ? $"grid {_cfgPreset.CellPx}px cells" : $"{_cfgCols * _cfgRows} × QR {_qrModules}×{_qrModules}";
         _status.Text = $"{FormatSize(_originalSize)} → {enc.BlockCount} blocks  ·  {what}  ·  {FormatSize(_frameBytes)}/frame × {_cfgFps} fps = {FormatSize((long)nominal)}/s max  ·  " +
-                       $"best case ≈ {firstPass:0}s  ·  frame {_framesShown}  ·  Space = pause, F11 = fullscreen";
+                       $"best case ≈ {firstPass:0}s  ·  showing {_achievedFps:0.0} frames/s  ·  Space = pause, F11 = fullscreen";
     }
 
     static string FormatSize(long b) => b switch
