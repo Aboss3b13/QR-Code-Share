@@ -163,7 +163,7 @@ class FountainDecoder(val transferId: Int, val payloadLength: Int, val blockSize
             LongArray(words).also { w -> for (i in rows[r].unknown) { val col = colOf[i]; w[col shr 6] = w[col shr 6] or (1L shl (col and 63)) } }
         }
         // Rank check on a copy first, so the expensive data XORs only run when we will succeed.
-        if (rk < u) return
+        if (rank(Array(bits.size) { bits[it].copyOf() }, u) < u) return
 
         val data = Array(rows.size) { rows[it].data }
         for (col in 0 until u) {
